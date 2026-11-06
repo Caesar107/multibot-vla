@@ -203,9 +203,15 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    # Camera conditioning: number of extra per-pixel channels (6 for Plücker ray maps). When > 0, a second,
+    # zero-initialized patch-embedding conv is applied to `plucker` and added to the RGB patch tokens. This is
+    # equivalent to widening the pretrained `embedding` conv to 3 + plucker_channels inputs with zero-init new
+    # weights, but keeps the pretrained parameter untouched (no checkpoint surgery) and the model is exactly the
+    # stock model at step 0.
+    plucker_channels: int = 0
 
     @nn.compact
-    def __call__(self, image, *, train=False):
+    def __call__(self, image, *, train=False, plucker=None):
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,
@@ -221,6 +227,25 @@ class _Module(nn.Module):
             name="embedding",
             dtype=jnp.float32,
         )(image)
+
+        if plucker is not None:
+            if not self.plucker_channels:
+                raise ValueError("plucker input given but plucker_channels == 0")
+            plucker = jnp.asarray(plucker, jnp.float32)
+            if plucker.shape[-1] != self.plucker_channels or plucker.shape[:-1] != image.shape[:-1]:
+                raise ValueError(f"plucker shape {plucker.shape} incompatible with image {image.shape}")
+            # The parameter is created at init time (fake_obs carries a plucker map); views without a ray map simply
+            # skip this branch.
+            x = x + nn.Conv(
+                self.width,
+                self.patch_size,
+                strides=self.patch_size,
+                padding="VALID",
+                name="plucker_embedding",
+                dtype=jnp.float32,
+                kernel_init=nn.initializers.zeros,
+                use_bias=False,
+            )(plucker)
 
         n, h, w, c = x.shape
         x = jnp.reshape(x, [n, h * w, c])

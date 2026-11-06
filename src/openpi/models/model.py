@@ -46,6 +46,9 @@ IMAGE_KEYS = (
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
 
+# Channels of a Plücker ray map ([direction, moment]); see `openpi.shared.camera_geometry`.
+PLUCKER_CHANNELS = 6
+
 
 # Data format
 #
@@ -62,6 +65,9 @@ IMAGE_RESOLUTION = (224, 224)
 #     "image_mask": {
 #         "base_0_rgb": bool[*b],  # True if image is valid
 #         ...  # Masks for additional views
+#     },
+#     "plucker": {  # Optional, per-pixel Plücker ray map for camera-conditioned models
+#         "base_0_rgb": float32[*b, h, w, 6],  # [d, o x d] in world frame, see shared/camera_geometry.py
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
@@ -106,6 +112,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Camera-conditioning specific fields.
+
+    # Optional per-pixel Plücker ray maps, keyed like `images` (only for the conditioned views). Same spatial
+    # resolution as the corresponding image. See `openpi.shared.camera_geometry`.
+    plucker: dict[str, at.Float[ArrayT, "*b h w 6"]] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -118,6 +130,9 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        plucker = data.get("plucker")
+        if plucker is not None and len(plucker) == 0:
+            plucker = None
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -126,6 +141,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            plucker=plucker,
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +149,8 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        if result.get("plucker") is None:
+            result.pop("plucker", None)
         return result
 
 
@@ -157,13 +175,26 @@ def preprocess_observation(
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
     batch_shape = observation.state.shape[:-1]
+    in_plucker = observation.plucker or {}
 
     out_images = {}
+    out_plucker = {}
     for key in image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
+
+        plucker = in_plucker.get(key)
+        if plucker is not None and plucker.shape[1:3] != image_resolution:
+            # Plücker maps are not clipped/padded like images: plain bilinear resize (LIBERO images are square, so
+            # resize_with_pad above is a plain resize as well).
+            if plucker.shape[1] * image_resolution[1] != plucker.shape[2] * image_resolution[0]:
+                raise ValueError(f"Plücker map {key} aspect ratio {plucker.shape[1:3]} != {image_resolution}")
+            logger.info(f"Resizing plucker {key} from {plucker.shape[1:3]} to {image_resolution}")
+            plucker = jax.image.resize(
+                plucker, (plucker.shape[0], *image_resolution, plucker.shape[3]), method=jax.image.ResizeMethod.LINEAR
+            )
 
         if train:
             # Convert from [-1, 1] to [0, 1] for augmax.
@@ -181,12 +212,22 @@ def preprocess_observation(
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            if plucker is None:
+                image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            else:
+                # Apply the *same* geometric augmentation to the ray map (DENSE: resampled, never color-jittered),
+                # so every pixel keeps the ray it was rendered with.
+                chain = augmax.Chain(*transforms, input_types=(augmax.InputType.IMAGE, augmax.InputType.DENSE))
+                image, plucker = jax.vmap(lambda r, img, pl, chain=chain: chain(r, (img, pl)))(
+                    sub_rngs, image, plucker
+                )
 
             # Back to [-1, 1].
             image = image * 2.0 - 1.0
 
         out_images[key] = image
+        if plucker is not None:
+            out_plucker[key] = plucker
 
     # obtain mask
     out_masks = {}
@@ -205,6 +246,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        plucker=out_plucker or None,
     )
 
 

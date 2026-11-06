@@ -127,6 +127,33 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _reindex_episode_bounds_by_id(dataset: lerobot_dataset.LeRobotDataset) -> None:
+    """Address episode frame bounds by the original episode id.
+
+    LeRobot builds ``episode_data_index`` in selection order, so its length is the number of
+    selected episodes. ``LeRobotDataset.__getitem__`` then indexes that table with the id stored
+    in the parquet. A subset whose ids are not ``0 .. n-1`` either raises IndexError (id 4362
+    into a length-2667 table) or reads another episode's action window. Parquet and video names
+    still use the original id, so only this lookup table changes.
+    """
+    episodes = dataset.episodes
+    if not episodes:
+        return
+    compact_from = dataset.episode_data_index["from"]
+    compact_to = dataset.episode_data_index["to"]
+    if len(compact_from) != len(episodes) or len(compact_to) != len(episodes):
+        raise ValueError(
+            f"episode_data_index length {len(compact_from)} does not match {len(episodes)} selected episodes"
+        )
+    width = max(int(episode_id) for episode_id in episodes) + 1
+    by_id_from = torch.empty(width, dtype=compact_from.dtype)
+    by_id_to = torch.empty(width, dtype=compact_to.dtype)
+    for position, episode_id in enumerate(episodes):
+        by_id_from[int(episode_id)] = compact_from[position]
+        by_id_to[int(episode_id)] = compact_to[position]
+    dataset.episode_data_index = {"from": by_id_from, "to": by_id_to}
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -140,10 +167,14 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if data_config.episodes is not None:
+        _reindex_episode_bounds_by_id(dataset)
+        logging.info("Using %d of %d episodes from %s", len(data_config.episodes), dataset_meta.total_episodes, repo_id)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

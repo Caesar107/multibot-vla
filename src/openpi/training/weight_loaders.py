@@ -46,12 +46,16 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Keys absent from the checkpoint that are allowed to keep their fresh initialization. By default: LoRA weights
+    # and the zero-initialized Plücker camera-conditioning patch embedding (see `siglip.py`), so a stock pi0/pi05
+    # checkpoint can seed a camera-conditioned model.
+    missing_regex: str = ".*lora.*|.*plucker.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA / Plücker weights.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

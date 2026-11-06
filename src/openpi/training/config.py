@@ -90,6 +90,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional subset of LeRobot episode indices to train on (None = all episodes).
+    episodes: Sequence[int] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -278,6 +281,13 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         )
 
 
+def _flat_scalar(value: Any) -> float:
+    """First element of a (possibly nested) list/scalar from episodes_stats.jsonl."""
+    while isinstance(value, list):
+        value = value[0]
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
@@ -287,6 +297,78 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    # Dataset carries per-frame base-camera geometry (`cam_K` (9,), `cam_c2w` (16,)), e.g. `libero_campose`
+    # produced by scripts/libero_campose. Required when the model uses `plucker_image_keys`.
+    with_camera_params: bool = False
+    # Only train on episodes whose per-frame `view_id` is in this set (resolved from meta/episodes_stats.jsonl).
+    # `(0,)` = canonical LIBERO agentview only, i.e. the original single-camera data with camera params attached.
+    view_ids: tuple[int, ...] | None = None
+    # Mix all canonical (view_id=0) episodes with a subsample of perturbed views (view_id>0) so that
+    # perturbed episodes make up this fraction of the training set. E.g. 0.25 / 0.5 / 0.75. Mutually
+    # exclusive with `view_ids`. Seed is fixed for reproducibility across workers / DLC restarts.
+    perturbed_view_fraction: float | None = None
+    perturbed_view_seed: int = 0
+
+    def _episodes_by_view(self) -> dict[int, list[int]]:
+        import json  # noqa: PLC0415
+
+        import lerobot.common.datasets.lerobot_dataset as lerobot_dataset  # noqa: PLC0415
+
+        stats_path = lerobot_dataset.HF_LEROBOT_HOME / self.repo_id / "meta" / "episodes_stats.jsonl"
+        by_view: dict[int, list[int]] = {}
+        with stats_path.open() as f:
+            for line in f:
+                row = json.loads(line)
+                view = row["stats"]["view_id"]
+                lo, hi = int(_flat_scalar(view["min"])), int(_flat_scalar(view["max"]))
+                if lo != hi:
+                    raise ValueError(f"episode {row['episode_index']} mixes view ids {lo}..{hi}")
+                by_view.setdefault(lo, []).append(int(row["episode_index"]))
+        return by_view
+
+    def _episodes_for_views(self) -> list[int]:
+        by_view = self._episodes_by_view()
+        wanted = set(self.view_ids)
+        episodes = [ep for vid, eps in sorted(by_view.items()) if vid in wanted for ep in eps]
+        if not episodes:
+            raise ValueError(f"no episodes with view_id in {sorted(wanted)} in {self.repo_id}")
+        return episodes
+
+    def _episodes_for_perturbed_fraction(self) -> list[int]:
+        """Keep every view_id=0 episode; subsample view_id>0 so perturbed / total ≈ `perturbed_view_fraction`."""
+        import numpy as np  # noqa: PLC0415
+
+        frac = self.perturbed_view_fraction
+        if frac is None:
+            raise ValueError("perturbed_view_fraction is None")
+        if not 0.0 < frac < 1.0:
+            raise ValueError(f"perturbed_view_fraction must be in (0, 1), got {frac}")
+
+        by_view = self._episodes_by_view()
+        canon = sorted(by_view.get(0, []))
+        perturbed = sorted(ep for vid, eps in by_view.items() if vid > 0 for ep in eps)
+        if not canon:
+            raise ValueError(f"no canonical (view_id=0) episodes in {self.repo_id}")
+        if not perturbed:
+            raise ValueError(f"no perturbed (view_id>0) episodes in {self.repo_id}")
+
+        # n_pert / (n_canon + n_pert) = frac  =>  n_pert = frac/(1-frac) * n_canon
+        n_pert = int(round(frac / (1.0 - frac) * len(canon)))
+        n_pert = max(1, min(n_pert, len(perturbed)))
+        rng = np.random.default_rng(self.perturbed_view_seed)
+        chosen = rng.choice(np.asarray(perturbed, dtype=np.int64), size=n_pert, replace=False)
+        episodes = sorted(canon) + sorted(int(x) for x in chosen.tolist())
+        logging.info(
+            "perturbed_view_fraction=%.2f (target) -> %d canon + %d perturbed = %d episodes "
+            "(actual perturbed share=%.3f, available perturbed=%d)",
+            frac,
+            len(canon),
+            n_pert,
+            len(episodes),
+            n_pert / len(episodes),
+            len(perturbed),
+        )
+        return episodes
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -298,19 +380,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.with_camera_params:
+            repack_structure[libero_policy.CAM_K_KEY] = "cam_K"
+            repack_structure[libero_policy.CAM_C2W_KEY] = "cam_c2w"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -318,8 +398,11 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
+        plucker_image_keys = tuple(getattr(model_config, "plucker_image_keys", ()))
         data_transforms = _transforms.Group(
-            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            inputs=[
+                libero_policy.LiberoInputs(model_type=model_config.model_type, plucker_image_keys=plucker_image_keys)
+            ],
             outputs=[libero_policy.LiberoOutputs()],
         )
 
@@ -346,12 +429,22 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
 
+        if self.view_ids is not None and self.perturbed_view_fraction is not None:
+            raise ValueError("set only one of view_ids and perturbed_view_fraction")
+        if self.perturbed_view_fraction is not None:
+            episodes = self._episodes_for_perturbed_fraction()
+        elif self.view_ids is not None:
+            episodes = self._episodes_for_views()
+        else:
+            episodes = None
+
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            episodes=episodes,
         )
 
 
@@ -760,6 +853,190 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Camera-conditioned LIBERO (CamPose / "Do You Know Where Your Camera Is?", Jiang et al. ICRA 2026).
+    # Data: `libero_campose` = official LIBERO demos re-rendered from 4 agentview poses per episode with per-frame
+    # intrinsics/extrinsics (scripts/libero_campose). Same hyper-parameters as pi05_libero.
+    #
+    # Plücker camera conditioning on the base camera.
+    TrainConfig(
+        name="pi05_libero_campose",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, plucker_image_keys=("base_0_rgb",)
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_campose",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            with_camera_params=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,  # DLC 8xA800 recipe (same as pi05_libero in the outer fork); pass --fsdp_devices 1 on one GPU
+    ),
+    # Same view-randomized `libero_campose` data, no Plücker and no camera params. Ablation against
+    # `pi05_libero_campose`: multi-view images only (full mix = 25% canon + 75% perturbed). Norm stats reused.
+    TrainConfig(
+        name="pi05_libero_multiview",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_campose",
+            assets=AssetsConfig(
+                assets_dir="/mnt/oss/zml/models/openpi/assets/pi05_libero_campose",
+                asset_id="libero_campose",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,  # DLC 8xA800 recipe (same as pi05_libero in the outer fork); pass --fsdp_devices 1 on one GPU
+    ),
+    # No-Plücker ablations: keep all view_id=0, subsample view_id=1..3 so perturbed share is 25/50/75%.
+    # Expected sizes with 2000 canon / 6000 perturbed: ~2667 / 4000 / 8000 episodes.
+    TrainConfig(
+        name="pi05_libero_multiview_p25",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_campose",
+            assets=AssetsConfig(
+                assets_dir="/mnt/oss/zml/models/openpi/assets/pi05_libero_campose",
+                asset_id="libero_campose",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            perturbed_view_fraction=0.25,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,
+    ),
+    TrainConfig(
+        name="pi05_libero_multiview_p50",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_campose",
+            assets=AssetsConfig(
+                assets_dir="/mnt/oss/zml/models/openpi/assets/pi05_libero_campose",
+                asset_id="libero_campose",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            perturbed_view_fraction=0.50,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,
+    ),
+    TrainConfig(
+        name="pi05_libero_multiview_p75",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_campose",
+            assets=AssetsConfig(
+                assets_dir="/mnt/oss/zml/models/openpi/assets/pi05_libero_campose",
+                asset_id="libero_campose",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            perturbed_view_fraction=0.75,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,
+    ),
+    # Plücker on the original single-camera LIBERO data (no view randomization). Canonical agentview K/c2w
+    # is injected in LiberoInputs. Same images/actions as `pi05_libero`; only the camera-conditioning params differ.
+    TrainConfig(
+        name="pi05_libero_campose_canon",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False, plucker_image_keys=("base_0_rgb",)
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir="/mnt/oss/zml/models/openpi/assets/pi05_libero",
+                asset_id="physical-intelligence/libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        assets_base_dir="/mnt/oss/zml/models/openpi/assets",
+        checkpoint_base_dir="/mnt/oss/zml/checkpoints/openpi",
+        num_train_steps=30_000,
+        num_workers=8,
+        fsdp_devices=2,  # DLC 8xA800 recipe (same as pi05_libero in the outer fork); pass --fsdp_devices 1 on one GPU
     ),
     #
     # Fine-tuning Aloha configs.

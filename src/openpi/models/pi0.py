@@ -78,6 +78,7 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        self.plucker_image_keys = tuple(config.plucker_image_keys)
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -85,9 +86,13 @@ class Pi0(_model.BaseModel):
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
+                plucker_channels=_model.PLUCKER_CHANNELS if self.plucker_image_keys else 0,
             )
         )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        fake_obs = config.fake_obs()
+        fake_plucker = next(iter(fake_obs.plucker.values())) if fake_obs.plucker else None
+        # Passing a plucker map at init creates the (zero-initialized) `plucker_embedding` parameter.
+        img.lazy_init(next(iter(fake_obs.images.values())), train=False, plucker=fake_plucker, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
@@ -111,7 +116,12 @@ class Pi0(_model.BaseModel):
         tokens = []
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            plucker = None
+            if name in self.plucker_image_keys:
+                if obs.plucker is None or name not in obs.plucker:
+                    raise ValueError(f"model expects a Plücker ray map for image {name!r} but none was provided")
+                plucker = obs.plucker[name]
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False, plucker=plucker)
 
             tokens.append(image_tokens)
             input_mask.append(

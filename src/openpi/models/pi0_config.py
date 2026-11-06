@@ -32,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Camera conditioning (CamPose / "Do You Know Where Your Camera Is?"): image keys whose per-pixel Plücker ray
+    # map `Observation.plucker[key]` is fed into the SigLIP patch embedding through a zero-initialized conv.
+    # Empty tuple = stock model. Typically ("base_0_rgb",): wrist cameras move with the arm and need no conditioning.
+    plucker_image_keys: tuple[str, ...] = ()
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -64,6 +69,7 @@ class Pi0Config(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        plucker_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, _model.PLUCKER_CHANNELS], jnp.float32)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -80,6 +86,7 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                plucker=dict.fromkeys(self.plucker_image_keys, plucker_spec) or None,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

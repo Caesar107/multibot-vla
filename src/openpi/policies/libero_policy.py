@@ -5,16 +5,31 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.shared import camera_geometry
+
+# Keys carrying the base ("agentview") camera geometry, used for Plücker camera conditioning.
+# `cam_K` (9,) is the row-major 3x3 pinhole matrix *at the resolution of the accompanying observation/image*
+# (256x256 in the LeRobot dataset, 224x224 from the eval client); `cam_c2w` (16,) is the row-major 4x4 MuJoCo
+# camera-to-world matrix (camera looks down -z). Both describe the raw render; the 180 degree rotation that
+# LIBERO images undergo is applied to the ray map here.
+CAM_K_KEY = "observation/cam_K"
+CAM_C2W_KEY = "observation/cam_c2w"
 
 
-def make_libero_example() -> dict:
+def make_libero_example(*, with_camera: bool = False) -> dict:
     """Creates a random input example for the Libero policy."""
-    return {
+    example = {
         "observation/state": np.random.rand(8),
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "do something",
     }
+    if with_camera:
+        example[CAM_K_KEY] = camera_geometry.intrinsics_from_fovy(45.0, 224, 224).reshape(-1)
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, 3] = [0.66, 0.0, 1.61]
+        example[CAM_C2W_KEY] = c2w.reshape(-1)
+    return example
 
 
 def _parse_image(image) -> np.ndarray:
@@ -38,6 +53,11 @@ class LiberoInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType
+    # Image keys for which a Plücker ray map is produced from `observation/cam_K` / `observation/cam_c2w`
+    # (camera conditioning, see `Pi0Config.plucker_image_keys`). Only "base_0_rgb" is supported for LIBERO.
+    plucker_image_keys: tuple[str, ...] = ()
+    # Resolution of the ray map; must match the model's image resolution.
+    plucker_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
 
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
@@ -68,6 +88,23 @@ class LiberoInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             },
         }
+
+        if self.plucker_image_keys:
+            if set(self.plucker_image_keys) != {"base_0_rgb"}:
+                raise ValueError(f"LIBERO only has camera parameters for base_0_rgb, got {self.plucker_image_keys}")
+            if CAM_K_KEY not in data or CAM_C2W_KEY not in data:
+                # Original single-camera LIBERO has no per-frame extrinsics; fill in the canonical agentview.
+                cam_k, cam_c2w = camera_geometry.canonical_libero_camera(*base_image.shape[:2])
+                data = {**data, CAM_K_KEY: cam_k, CAM_C2W_KEY: cam_c2w}
+            inputs["plucker"] = {
+                "base_0_rgb": camera_geometry.plucker_from_flat(
+                    data[CAM_K_KEY],
+                    data[CAM_C2W_KEY],
+                    src_hw=tuple(base_image.shape[:2]),
+                    dst_hw=tuple(self.plucker_resolution),
+                    rotate_180=True,
+                )
+            }
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
